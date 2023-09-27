@@ -1,9 +1,9 @@
 use super::{StrError, PYTHON_HEADER};
-use std::fs;
-use std::fs::File;
-use std::io::Write;
 use std::path::Path;
-use std::process::Command;
+use std::sync::{Arc, Mutex};
+use pyo3::exceptions::PyRuntimeError;
+use pyo3::{prelude::*, intern};
+use pyo3::types::IntoPyDict;
 
 /// Writes a python file and call python3 on it
 ///
@@ -16,44 +16,70 @@ use std::process::Command;
 /// # Note
 ///
 /// The contents of [PYTHON_HEADER] are added at the beginning of the file.
-pub(crate) fn call_python3(python_commands: &String, path: &Path) -> Result<String, StrError> {
-    // create directory
-    if let Some(p) = path.parent() {
-        fs::create_dir_all(p).map_err(|_| "cannot create directory")?;
-    }
+pub(crate) fn call_python3(python_commands: &String, _path: &Path) -> Result<String, StrError> {
+    pyo3::prepare_freethreaded_python();
 
     // combine header with commands
-    let mut contents = String::new();
-    contents.push_str(PYTHON_HEADER);
-    contents.push_str(python_commands);
+    let mut code = String::new();
+    code.push_str(PYTHON_HEADER);
+    code.push_str(python_commands);
 
-    // write file
-    let mut file = File::create(path).map_err(|_| "cannot create file")?;
-    file.write_all(contents.as_bytes()).map_err(|_| "cannot write file")?;
+    // let stdout = Arc::new(Mutex::new(String::new()));
+    // let stderr = Arc::new(Mutex::new(String::new()));
 
-    // force sync
-    file.sync_all().map_err(|_| "cannot sync file")?;
+    pyo3::Python::with_gil(|py| -> Result<(), PyErr> {
+        let io = py.import("io")?;
+        let sys = py.import("sys")?;
 
-    // execute file
-    let output = Command::new("python3")
-        .arg(path)
-        .output()
-        .map_err(|_| "cannot run python3")?;
+        let stdout = io.getattr(intern!(py, "StringIO"))?.call0()?;
+        let stderr = io.getattr(intern!(py, "StringIO"))?.call0()?;
 
-    // results
-    let out = String::from_utf8(output.stdout).unwrap();
-    let err = String::from_utf8(output.stderr).unwrap();
+        let old_stdout = sys.getattr(intern!(py, "stdout"))?;
+        let old_stderr = sys.getattr(intern!(py, "stderr"))?;
+
+        sys.setattr(intern!(py, "stdout"), stdout)?;
+        sys.setattr(intern!(py, "stderr"), stderr)?;
+
+        let res = py.run(&code, None, None);
+
+        sys.setattr(intern!(py, "stdout"), old_stdout);
+        sys.setattr(intern!(py, "stderr"), old_stderr);
+
+        let stdout: String = stdout.call_method0(intern!(py, "getvalue"))?.extract()?;
+        let stderr: String = stderr.call_method0(intern!(py, "getvalue"))?.extract()?;
+
+        res.and(res_stdout).and(res_stderr)
+    }).map_err(|err| {
+        eprintln!("{:#}", err);
+        Err("failed to execute Python code")
+    });
+
     let mut results = String::new();
-    if out.len() > 0 {
-        results.push_str(&out);
+    let stdout = stdout.lock().map_err(|_| "Python stdout was poisoned")?;
+    let stderr = stderr.lock().map_err(|_| "Python stdout was poisoned")?;
+    if !stdout.is_empty() {
+        results.push_str(&stdout);
     }
-    if err.len() > 0 {
-        results.push_str(&err)
+    if !stderr.is_empty() {
+        results.push_str(&stderr);
     }
 
     // done
     Ok(results)
 }
+
+// #[pyclass]
+// struct RedirectStdOut {
+//     stdout: Arc<Mutex<String>>,
+// }
+
+// #[pymethods]
+// impl RedirectStdOut {
+//     fn write(&self, data: &str) -> PyResult<()> {
+//         self.stdout.lock().map_err(|err| PyRuntimeError::new_err(format!("{err}")))?.push_str(data);
+//         Ok(())
+//     }
+// }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
